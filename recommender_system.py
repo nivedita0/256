@@ -10,7 +10,6 @@ from collections import defaultdict, Counter
 from scipy.sparse import csr_matrix, diags
 from eda_analysis import perform_eda
 
-# Optional heavy dependencies (only needed for neural models)
 try:
     import torch
     import torch.nn as nn
@@ -126,7 +125,12 @@ class RecommenderSystem:
         perform_eda(self.user_items, self.item_users)
     
     def build_user_item_matrix(self, normalize=False):
-        """Build sparse user-item interaction matrix"""
+        """
+        Build user-item interaction matrix
+        Args:
+            normalize: If True, applies TF-IDF-like normalization to reduce power user bias
+                      (weight = 1/sqrt(user_item_count))
+        """
         print("Building user-item matrix...")
         
         self.user_ids = sorted(self.user_items.keys())
@@ -150,14 +154,13 @@ class RecommenderSystem:
                                           shape=(len(self.user_ids), len(self.item_ids)))
         
         if normalize:
-            row_sums = np.array(self.user_item_matrix.sum(axis=1)).flatten()
-            row_sums[row_sums == 0] = 1
-            row_scaling = diags(1.0 / row_sums)
-            self.user_item_matrix = row_scaling @ self.user_item_matrix
+                    # TF-IDF-like normalization: 1 / sqrt(user_item_count)
+                    # This gives less weight to power users
+                    weight = 1.0 / np.sqrt(num_user_items)
+                else:
+                    weight = 1.0  # Binary interaction
         
-        # Compute item popularity
-        for item_id, users in self.item_users.items():
-            self.item_popularity[item_id] = len(users)
+                data.append(weight)
         
         print(f"User-item matrix shape: {self.user_item_matrix.shape}")
         print(f"Sparsity: {100 * (1 - self.user_item_matrix.nnz / (self.user_item_matrix.shape[0] * self.user_item_matrix.shape[1])):.2f}%")
