@@ -157,10 +157,9 @@ class RecommenderSystem:
                     # TF-IDF-like normalization: 1 / sqrt(user_item_count)
                     # This gives less weight to power users
                     weight = 1.0 / np.sqrt(num_user_items)
-                else:
-                    weight = 1.0  # Binary interaction
-        
-                data.append(weight)
+        else:
+            weight = 1.0  # Binary interaction
+        data.append(weight)
         
         print(f"User-item matrix shape: {self.user_item_matrix.shape}")
         print(f"Sparsity: {100 * (1 - self.user_item_matrix.nnz / (self.user_item_matrix.shape[0] * self.user_item_matrix.shape[1])):.2f}%")
@@ -371,7 +370,7 @@ class RecommenderSystem:
                                      len(self.item_ids), num_negatives)
         
         model = NeuCF(len(self.user_ids), len(self.item_ids), embedding_dim, mlp_layers).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.00001)
         criterion = nn.BCEWithLogitsLoss()
         
         dataloader_kwargs = {
@@ -573,7 +572,7 @@ class RecommenderSystem:
                                      len(self.item_ids), num_negatives)
         
         model = GMF(len(self.user_ids), len(self.item_ids), embedding_dim).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.00001)
         criterion = nn.BCEWithLogitsLoss()
         
         dataloader_kwargs = {
