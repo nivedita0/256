@@ -10,38 +10,22 @@ from collections import defaultdict, Counter
 from scipy.sparse import csr_matrix, diags
 from eda_analysis import perform_eda
 
-try:
-    import torch
-    import torch.nn as nn
-except ImportError:
-    torch = None
-    nn = None
-
 warnings.filterwarnings('ignore')
 
 
 def check_gpu_availability():
-    """Check GPU availability and return device info"""
+    """Check GPU availability for cuPy (cosine similarity acceleration)"""
     gpu_available = False
     device_info = {}
-    
-    # Check PyTorch GPU
-    if torch is not None:
-        gpu_available = torch.cuda.is_available()
-        if gpu_available:
-            device_info['pytorch'] = {
-                'device': torch.cuda.get_device_name(0),
-                'memory': f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB"
-            }
     
     # Check cuPy (for cosine similarity)
     try:
         import cupy as cp
         device_info['cupy'] = {'available': True}
         gpu_available = True
-    except ImportError:
+except ImportError:
         device_info['cupy'] = {'available': False}
-    
+
     return gpu_available, device_info
 
 
@@ -61,14 +45,6 @@ class RecommenderSystem:
         self.item_popularity = {}  # Track item popularity
         self.popular_items_cache = None  # Cache popular items
         self.reverse_similarity_index = None  # Reverse index for similarity
-        self.neucf_model = None  # NeuCF neural model
-        self.neucf_device = None  # Device for NeuCF model
-        self.use_neucf = False  # Flag for using NeuCF
-        self.gmf_model = None  # GMF neural model
-        self.gmf_device = None  # Device for GMF model
-        self.use_gmf = False  # Flag for using GMF
-        self.cosine_similarity_matrix = None  # Store cosine similarity for ensemble
-        self.use_ensemble = False  # Flag for using ensemble
         
     def load_data(self, filename, test_ratio=0.0, random_seed=42):
         """
@@ -96,7 +72,7 @@ class RecommenderSystem:
                 all_user_items[user_id] = items
         
         # Split into train/test if requested
-        for user_id, items in all_user_items.items():
+            for user_id, items in all_user_items.items():
             if test_ratio > 0 and len(items) > 1:
                 # Split items for this user
                 num_test = max(1, int(len(items) * test_ratio))
@@ -106,9 +82,9 @@ class RecommenderSystem:
                 self.user_items[user_id] = train_items
                 self.test_user_items[user_id] = test_items
                 
-                for item in train_items:
-                    self.item_users[item].add(user_id)
-            else:
+                    for item in train_items:
+                        self.item_users[item].add(user_id)
+        else:
                 # No split - all items go to training
                 self.user_items[user_id] = set(items)
                 for item in items:
@@ -119,17 +95,16 @@ class RecommenderSystem:
             total_train = sum(len(items) for items in self.user_items.values())
             total_test = sum(len(items) for items in self.test_user_items.values())
             print(f"Train interactions: {total_train}, Test interactions: {total_test}")
-    
+        
     def perform_eda(self):
         """Perform exploratory data analysis"""
         perform_eda(self.user_items, self.item_users)
-    
+        
     def build_user_item_matrix(self, normalize=False):
         """
         Build user-item interaction matrix
         Args:
             normalize: If True, applies TF-IDF-like normalization to reduce power user bias
-                      (weight = 1/sqrt(user_item_count))
         """
         print("Building user-item matrix...")
         
@@ -145,22 +120,23 @@ class RecommenderSystem:
             user_idx = self.user_to_idx[user_id]
             for item_id in items:
                 if item_id in self.item_to_idx:
-                    item_idx = self.item_to_idx[item_id]
-                    rows.append(user_idx)
-                    cols.append(item_idx)
+                item_idx = self.item_to_idx[item_id]
+                rows.append(user_idx)
+                cols.append(item_idx)
                     data.append(1.0)
-        
+                
         self.user_item_matrix = csr_matrix((data, (rows, cols)), 
                                           shape=(len(self.user_ids), len(self.item_ids)))
         
-        if normalize:
-                    # TF-IDF-like normalization: 1 / sqrt(user_item_count)
-                    # This gives less weight to power users
-                    weight = 1.0 / np.sqrt(num_user_items)
-                else:
-                    weight = 1.0  # Binary interaction
+                if normalize:
+            row_sums = np.array(self.user_item_matrix.sum(axis=1)).flatten()
+            row_sums[row_sums == 0] = 1
+            row_scaling = diags(1.0 / row_sums)
+            self.user_item_matrix = row_scaling @ self.user_item_matrix
         
-                data.append(weight)
+        # Compute item popularity
+        for item_id, users in self.item_users.items():
+            self.item_popularity[item_id] = len(users)
         
         print(f"User-item matrix shape: {self.user_item_matrix.shape}")
         print(f"Sparsity: {100 * (1 - self.user_item_matrix.nnz / (self.user_item_matrix.shape[0] * self.user_item_matrix.shape[1])):.2f}%")
@@ -179,7 +155,11 @@ class RecommenderSystem:
         
         # Auto-detect GPU if not specified
         if use_gpu is None:
-            use_gpu = torch is not None and torch.cuda.is_available()
+            try:
+                import cupy as cp
+                use_gpu = True
+            except ImportError:
+                use_gpu = False
         
         # Adjust chunk size for GPU
         if use_gpu and chunk_size < 2000:
@@ -231,8 +211,8 @@ class RecommenderSystem:
             norms[norms == 0] = 1
             
             similarity_dict = {}
-            for i in range(0, num_items, chunk_size):
-                end_i = min(i + chunk_size, num_items)
+        for i in range(0, num_items, chunk_size):
+            end_i = min(i + chunk_size, num_items)
                 chunk_matrix = item_user_matrix[i:end_i]
                 similarities = (chunk_matrix @ item_user_matrix.T).toarray()
                 
@@ -243,12 +223,9 @@ class RecommenderSystem:
                     similarity_dict[item_idx] = {top_idx: float(scores[top_idx]) for top_idx in top_indices if scores[top_idx] > 0}
                 
                 if (end_i) % (chunk_size * 5) == 0:
-                    print(f"  Processed {end_i}/{num_items} items...")
+                print(f"  Processed {end_i}/{num_items} items...")
         
         self.item_similarity_matrix = similarity_dict
-        
-        # Store cosine similarity for ensemble
-        self.cosine_similarity_matrix = self.item_similarity_matrix.copy()
         
         print("  Building reverse similarity index...")
         self.reverse_similarity_index = defaultdict(set)
@@ -256,540 +233,6 @@ class RecommenderSystem:
             for similar_item_idx in similar_items_dict.keys():
                 self.reverse_similarity_index[similar_item_idx].add(item_idx)
         print("Item similarity matrix computed!")
-    
-    def compute_neucf_factors(self, embedding_dim=64, mlp_layers=None, 
-                              epochs=20, batch_size=256, lr=0.001, num_negatives=4):
-        """
-        Compute NeuCF (Neural Collaborative Filtering) factors
-        
-        Args:
-            embedding_dim: Embedding dimension (default: 64)
-            mlp_layers: MLP layer sizes (default: [64, 32, 16])
-            epochs: Training epochs (default: 20)
-            batch_size: Batch size (default: 256)
-            lr: Learning rate (default: 0.001)
-            num_negatives: Number of negative samples per positive interaction
-        
-        Expected: NDCG@20: 35-45%
-        """
-        if mlp_layers is None:
-            mlp_layers = [64, 32, 16]
-        
-        if torch is None or nn is None:
-            print("ERROR: PyTorch not found!")
-            print("Install with: pip install torch")
-            return
-        
-        try:
-            from torch.utils.data import Dataset, DataLoader
-        except ImportError:
-            print("ERROR: torch.utils.data not available!")
-            print("Install PyTorch with: pip install torch")
-            return
-        
-        print(f"Computing NeuCF factors (embedding_dim={embedding_dim}, epochs={epochs})...")
-        print("  NeuCF combines GMF and MLP for non-linear patterns!")
-        
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if torch.cuda.is_available():
-            print(f"  Using GPU: {torch.cuda.get_device_name(0)}")
-            if batch_size < 1024:
-                batch_size = 1024
-                print(f"  Increased batch_size to {batch_size} for GPU optimization")
-            use_amp = True
-            scaler = torch.cuda.amp.GradScaler()
-            print("  Enabled mixed precision training (FP16) for faster training")
-        else:
-            print("  Using CPU")
-            use_amp = False
-        
-        # NeuCF Model
-        class NeuCF(nn.Module):
-            def __init__(self, num_users, num_items, embedding_dim, mlp_layers, dropout=0.2):
-                super().__init__()
-                self.user_embedding_gmf = nn.Embedding(num_users, embedding_dim)
-                self.item_embedding_gmf = nn.Embedding(num_items, embedding_dim)
-                self.user_embedding_mlp = nn.Embedding(num_users, embedding_dim)
-                self.item_embedding_mlp = nn.Embedding(num_items, embedding_dim)
-                
-                mlp_input_dim = embedding_dim * 2
-                layers = []
-                for i, layer_size in enumerate(mlp_layers):
-                    input_dim = mlp_input_dim if i == 0 else mlp_layers[i-1]
-                    layers.append(nn.Linear(input_dim, layer_size))
-                    layers.append(nn.ReLU())
-                    layers.append(nn.Dropout(dropout))
-                self.mlp = nn.Sequential(*layers)
-                
-                self.predict_layer = nn.Linear(embedding_dim + mlp_layers[-1], 1)
-            
-            def forward(self, user_ids, item_ids):
-                user_emb_gmf = self.user_embedding_gmf(user_ids)
-                item_emb_gmf = self.item_embedding_gmf(item_ids)
-                gmf_vector = user_emb_gmf * item_emb_gmf
-                
-                user_emb_mlp = self.user_embedding_mlp(user_ids)
-                item_emb_mlp = self.item_embedding_mlp(item_ids)
-                mlp_vector = torch.cat([user_emb_mlp, item_emb_mlp], dim=1)
-                mlp_vector = self.mlp(mlp_vector)
-                
-                concat_vector = torch.cat([gmf_vector, mlp_vector], dim=1)
-                prediction = self.predict_layer(concat_vector)
-                return prediction.squeeze(-1)
-        
-        class InteractionDataset(Dataset):
-            def __init__(self, user_items, user_to_idx, item_to_idx, num_items, num_negatives):
-                self.samples = []
-                all_item_indices = np.arange(num_items)
-                rng = np.random.default_rng(seed=42)
-                
-                for user_id, items in user_items.items():
-                    if not items:
-                        continue
-                    user_idx = user_to_idx[user_id]
-                    item_indices = [item_to_idx[item_id] for item_id in items if item_id in item_to_idx]
-                    if not item_indices:
-                        continue
-                    positive_set = set(item_indices)
-                    
-                    for pos_item_idx in item_indices:
-                        self.samples.append((user_idx, pos_item_idx, 1.0))
-                        
-                        for _ in range(num_negatives):
-                            neg_item_idx = rng.choice(all_item_indices)
-                            while neg_item_idx in positive_set:
-                                neg_item_idx = rng.choice(all_item_indices)
-                            self.samples.append((user_idx, neg_item_idx, 0.0))
-            
-            def __len__(self):
-                return len(self.samples)
-            
-            def __getitem__(self, idx):
-                return self.samples[idx]
-        
-        dataset = InteractionDataset(self.user_items, self.user_to_idx, self.item_to_idx, 
-                                     len(self.item_ids), num_negatives)
-        
-        model = NeuCF(len(self.user_ids), len(self.item_ids), embedding_dim, mlp_layers).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.BCEWithLogitsLoss()
-        
-        dataloader_kwargs = {
-            'batch_size': batch_size,
-            'shuffle': True,
-            'num_workers': 4 if torch.cuda.is_available() else 0,
-            'pin_memory': torch.cuda.is_available()
-        }
-        dataloader = DataLoader(dataset, **dataloader_kwargs)
-        
-        print("  Training NeuCF model")
-        model.train()
-        best_loss = float('inf')
-        patience = 3
-        patience_counter = 0
-        
-        for epoch in range(epochs):
-            total_loss = 0
-            num_batches = 0
-            
-            for batch in dataloader:
-                user_ids, item_ids, labels = batch
-                user_ids = user_ids.to(device, non_blocking=True)
-                item_ids = item_ids.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-                
-                optimizer.zero_grad()
-                
-                if use_amp:
-                    with torch.cuda.amp.autocast():
-                        predictions = model(user_ids, item_ids)
-                        loss = criterion(predictions, labels)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    predictions = model(user_ids, item_ids)
-                    loss = criterion(predictions, labels)
-                    loss.backward()
-                    optimizer.step()
-                
-                total_loss += float(loss.item())
-                num_batches += 1
-            
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0
-            
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-            if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
-                print(f"    Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
-            
-            if avg_loss < 0.0001 or patience_counter >= patience:
-                if avg_loss < 0.0001:
-                    print(f"    Early stopping: Loss converged to {avg_loss:.6f} at epoch {epoch+1}")
-                else:
-                    print(f"    Early stopping: No improvement for {patience} epochs (best loss: {best_loss:.6f})")
-                break
-        
-        self.neucf_model = model
-        self.neucf_device = device
-        self.use_neucf = True
-        self.use_gmf = False
-        
-        print("  NeuCF model trained!")
-        print("  Expected NDCG@20: 35-45%")
-    
-    def _recommend_items_neucf(self, user_id, n_recommendations=20):
-        """Generate recommendations using NeuCF"""
-        if self.neucf_model is None or not self.use_neucf:
-            raise ValueError("NeuCF model not trained. Call compute_neucf_factors() first.")
-        if torch is None:
-            raise ImportError("PyTorch not available for NeuCF recommendations.")
-        
-        user_idx = self.user_to_idx[user_id]
-        user_items = self.user_items[user_id]
-        
-        self.neucf_model.eval()
-        num_items = len(self.item_ids)
-        with torch.no_grad():
-            user_tensor = torch.full((num_items,), user_idx, dtype=torch.long, device=self.neucf_device)
-            item_tensor = torch.arange(num_items, dtype=torch.long, device=self.neucf_device)
-            scores = torch.sigmoid(self.neucf_model(user_tensor, item_tensor)).cpu().numpy()
-        
-        top_indices = np.argsort(scores)[::-1][:n_recommendations * 2]
-        
-        recommendations = []
-        for idx in top_indices:
-            item_id = self.idx_to_item[idx]
-            if item_id not in user_items:
-                recommendations.append(item_id)
-                if len(recommendations) >= n_recommendations:
-                    break
-        
-        if len(recommendations) < n_recommendations:
-            popular_items = self._get_popular_items(1000)
-            for item in popular_items:
-                if item not in user_items and item not in recommendations:
-                    recommendations.append(item)
-                    if len(recommendations) >= n_recommendations:
-                        break
-        
-        return recommendations[:n_recommendations]
-
-    def compute_gmf_factors(self, embedding_dim=64, epochs=20, batch_size=256, lr=0.001, num_negatives=4):
-        """
-        Compute GMF (Generalized Matrix Factorization) factors
-        GMF is a simpler neural approach than NeuCF
-        
-        Args:
-            embedding_dim: Embedding dimension (default: 64)
-            epochs: Training epochs (default: 20)
-            batch_size: Batch size (default: 256)
-            lr: Learning rate (default: 0.001)
-            num_negatives: Number of negative samples per positive interaction
-        
-        Expected: NDCG@20: 32-38%
-        """
-        if torch is None or nn is None:
-            print("ERROR: PyTorch not found!")
-            print("Install with: pip install torch")
-            return
-        
-        try:
-            from torch.utils.data import Dataset, DataLoader
-        except ImportError:
-            print("ERROR: torch.utils.data not available!")
-            print("Install PyTorch with: pip install torch")
-            return
-        
-        print(f"Computing GMF factors (embedding_dim={embedding_dim}, epochs={epochs})...")
-        print("  GMF is a simpler neural method than NeuCF!")
-        
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if torch.cuda.is_available():
-            print(f"  Using GPU: {torch.cuda.get_device_name(0)}")
-            if batch_size < 1024:
-                batch_size = 1024
-                print(f"  Increased batch_size to {batch_size} for GPU optimization")
-            use_amp = True
-            scaler = torch.cuda.amp.GradScaler()
-            print("  Enabled mixed precision training (FP16) for faster training")
-        else:
-            print("  Using CPU")
-            use_amp = False
-        
-        # GMF Model
-        class GMF(nn.Module):
-            def __init__(self, num_users, num_items, embedding_dim):
-                super().__init__()
-                self.user_embedding = nn.Embedding(num_users, embedding_dim)
-                self.item_embedding = nn.Embedding(num_items, embedding_dim)
-                self.output_layer = nn.Linear(embedding_dim, 1)
-                
-                nn.init.normal_(self.user_embedding.weight, std=0.01)
-                nn.init.normal_(self.item_embedding.weight, std=0.01)
-            
-            def forward(self, user_ids, item_ids):
-                user_emb = self.user_embedding(user_ids)
-                item_emb = self.item_embedding(item_ids)
-                element_product = user_emb * item_emb
-                output = self.output_layer(element_product)
-                return output.squeeze(-1)
-        
-        class InteractionDataset(Dataset):
-            def __init__(self, user_items, user_to_idx, item_to_idx, num_items, num_negatives):
-                self.samples = []
-                all_item_indices = np.arange(num_items)
-                rng = np.random.default_rng(seed=42)
-                
-                for user_id, items in user_items.items():
-                    if not items:
-                        continue
-                    user_idx = user_to_idx[user_id]
-                    item_indices = [item_to_idx[item_id] for item_id in items if item_id in item_to_idx]
-                    if not item_indices:
-                        continue
-                    positive_set = set(item_indices)
-                    
-                    for pos_item_idx in item_indices:
-                        self.samples.append((user_idx, pos_item_idx, 1.0))
-                        
-                        for _ in range(num_negatives):
-                            neg_item_idx = rng.choice(all_item_indices)
-                            while neg_item_idx in positive_set:
-                                neg_item_idx = rng.choice(all_item_indices)
-                            self.samples.append((user_idx, neg_item_idx, 0.0))
-            
-            def __len__(self):
-                return len(self.samples)
-            
-            def __getitem__(self, idx):
-                return self.samples[idx]
-        
-        dataset = InteractionDataset(self.user_items, self.user_to_idx, self.item_to_idx, 
-                                     len(self.item_ids), num_negatives)
-        
-        model = GMF(len(self.user_ids), len(self.item_ids), embedding_dim).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.BCEWithLogitsLoss()
-        
-        dataloader_kwargs = {
-            'batch_size': batch_size,
-            'shuffle': True,
-            'num_workers': 4 if torch.cuda.is_available() else 0,
-            'pin_memory': torch.cuda.is_available()
-        }
-        dataloader = DataLoader(dataset, **dataloader_kwargs)
-        
-        print("  Training GMF model")
-        model.train()
-        best_loss = float('inf')
-        patience = 3
-        patience_counter = 0
-        
-        for epoch in range(epochs):
-            total_loss = 0
-            num_batches = 0
-            
-            for batch in dataloader:
-                user_ids, item_ids, labels = batch
-                user_ids = user_ids.to(device, non_blocking=True)
-                item_ids = item_ids.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-                
-                optimizer.zero_grad()
-                
-                if use_amp:
-                    with torch.cuda.amp.autocast():
-                        predictions = model(user_ids, item_ids)
-                        loss = criterion(predictions, labels)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    predictions = model(user_ids, item_ids)
-                    loss = criterion(predictions, labels)
-                    loss.backward()
-                    optimizer.step()
-                
-                total_loss += float(loss.item())
-                num_batches += 1
-            
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0
-            
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-            if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
-                print(f"    Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
-            
-            if avg_loss < 0.0001 or patience_counter >= patience:
-                if avg_loss < 0.0001:
-                    print(f"    Early stopping: Loss converged to {avg_loss:.6f} at epoch {epoch+1}")
-                else:
-                    print(f"    Early stopping: No improvement for {patience} epochs (best loss: {best_loss:.6f})")
-                break
-        
-        self.gmf_model = model
-        self.gmf_device = device
-        self.use_gmf = True
-        self.use_neucf = False
-        
-        print("  GMF model trained!")
-        print("  Expected NDCG@20: 32-38%")
-    
-    def _recommend_items_gmf(self, user_id, n_recommendations=20):
-        """Generate recommendations using GMF"""
-        if self.gmf_model is None or not self.use_gmf:
-            raise ValueError("GMF model not trained. Call compute_gmf_factors() first.")
-        if torch is None:
-            raise ImportError("PyTorch not available for GMF recommendations.")
-        
-        user_idx = self.user_to_idx[user_id]
-        user_items = self.user_items[user_id]
-        
-        self.gmf_model.eval()
-        num_items = len(self.item_ids)
-        with torch.no_grad():
-            user_tensor = torch.full((num_items,), user_idx, dtype=torch.long, device=self.gmf_device)
-            item_tensor = torch.arange(num_items, dtype=torch.long, device=self.gmf_device)
-            scores = self.gmf_model(user_tensor, item_tensor).cpu().numpy()
-        
-        top_indices = np.argsort(scores)[::-1][:n_recommendations * 2]
-        
-        recommendations = []
-        for idx in top_indices:
-            item_id = self.idx_to_item[idx]
-            if item_id not in user_items:
-                recommendations.append(item_id)
-                if len(recommendations) >= n_recommendations:
-                    break
-        
-        if len(recommendations) < n_recommendations:
-            popular_items = self._get_popular_items(1000)
-            for item in popular_items:
-                if item not in user_items and item not in recommendations:
-                    recommendations.append(item)
-                    if len(recommendations) >= n_recommendations:
-                        break
-        
-        return recommendations[:n_recommendations]
-
-    def _recommend_items_ensemble(self, user_id, n_recommendations=20):
-        """
-        Ensemble method: Combines NeuCF, GMF, and Cosine similarity
-        """
-        if user_id not in self.user_items:
-            popular_items = self._get_popular_items(n_recommendations)
-            return popular_items[:n_recommendations]
-        
-        user_items = self.user_items[user_id]
-        all_scores = {}
-        method_count = 0
-        
-        # Method 1: Cosine similarity
-        if self.cosine_similarity_matrix:
-            cosine_recs = self._get_item_based_scores(user_id, self.cosine_similarity_matrix)
-            max_cosine = max(cosine_recs.values()) if cosine_recs else 1.0
-            for item_id, score in cosine_recs.items():
-                normalized_score = score / max_cosine if max_cosine > 0 else 0
-                all_scores[item_id] = all_scores.get(item_id, 0) + 0.25 * normalized_score
-            method_count += 1
-        
-        # Method 2: NeuCF
-        if hasattr(self, 'use_neucf') and self.use_neucf and user_id in self.user_to_idx:
-            try:
-                neucf_recs = self._recommend_items_neucf(user_id, n_recommendations * 3)
-                for rank, item_id in enumerate(neucf_recs):
-                    if item_id not in user_items:
-                        score = np.exp(-rank * 0.1)
-                        all_scores[item_id] = all_scores.get(item_id, 0) + 0.45 * score
-                method_count += 1
-            except:
-                pass
-        
-        # Method 3: GMF
-        if hasattr(self, 'use_gmf') and self.use_gmf and user_id in self.user_to_idx:
-            try:
-                gmf_recs = self._recommend_items_gmf(user_id, n_recommendations * 3)
-                for rank, item_id in enumerate(gmf_recs):
-                    if item_id not in user_items:
-                        score = np.exp(-rank * 0.1)
-                        all_scores[item_id] = all_scores.get(item_id, 0) + 0.30 * score
-                method_count += 1
-            except:
-                pass
-        
-        # Normalize scores
-        if method_count > 1:
-            max_score = max(all_scores.values()) if all_scores else 1.0
-            if max_score > 0:
-                all_scores = {item: score / max_score for item, score in all_scores.items()}
-        
-        # Sort and return
-        sorted_items = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
-        recommendations = [item_id for item_id, score in sorted_items[:n_recommendations]]
-        
-        # Fill with popular items if needed
-        if len(recommendations) < n_recommendations:
-            popular_items = self._get_popular_items(1000)
-            for item in popular_items:
-                if item not in user_items and item not in recommendations:
-                    recommendations.append(item)
-                    if len(recommendations) >= n_recommendations:
-                        break
-        
-        return recommendations[:n_recommendations]
-    
-    def _get_item_based_scores(self, user_id, similarity_matrix):
-        """Helper: Get item-based CF scores for ensemble"""
-        if user_id not in self.user_items:
-            return {}
-        
-        user_items = self.user_items[user_id]
-        interacted_item_indices = [self.item_to_idx[item] for item in user_items if item in self.item_to_idx]
-        
-        if not interacted_item_indices:
-            return {}
-        
-        # Get candidate items
-        candidate_items = set()
-        for interacted_item_idx in interacted_item_indices:
-            if isinstance(similarity_matrix, dict):
-                if interacted_item_idx in similarity_matrix:
-                    for similar_item_idx in similarity_matrix[interacted_item_idx].keys():
-                        candidate_items.add(self.idx_to_item[similar_item_idx])
-        
-        candidate_items -= user_items
-        
-        # Compute scores
-        scores = {}
-        for item_id in candidate_items:
-            item_idx = self.item_to_idx[item_id]
-            similarity_scores = []
-            for interacted_item_idx in interacted_item_indices:
-                if isinstance(similarity_matrix, dict):
-                    if item_idx in similarity_matrix:
-                        similarity = similarity_matrix[item_idx].get(interacted_item_idx, 0.0)
-                    elif interacted_item_idx in similarity_matrix:
-                        similarity = similarity_matrix[interacted_item_idx].get(item_idx, 0.0)
-                    else:
-                        similarity = 0.0
-                else:
-                    similarity = similarity_matrix[item_idx, interacted_item_idx]
-                
-                if similarity > 0:
-                    similarity_scores.append(similarity)
-            
-            scores[item_id] = sum(similarity_scores) if similarity_scores else 0.0
-        
-        return scores
         
     def _get_popular_items(self, n=1000):
         """Cache popular items to avoid recomputing"""
@@ -800,32 +243,16 @@ class RecommenderSystem:
             self.popular_items_cache = [item_id for item_id, _ in item_counts.most_common(n)]
         return self.popular_items_cache
     
-    def recommend_items_item_based(self, user_id, n_recommendations=20, popularity_penalty=0.0, use_svd=False, use_als=False, use_ensemble=False):
+    def recommend_items_item_based(self, user_id, n_recommendations=20, popularity_penalty=0.0):
         """
-        Generate recommendations
+        Generate recommendations using item-based collaborative filtering
+        
+        Args:
+            user_id: User ID to generate recommendations for
+            n_recommendations: Number of recommendations to generate
+            popularity_penalty: Penalty factor (0.0-1.0) to reduce popularity bias
         """
-        # Use ensemble if requested
-        if use_ensemble and self.use_ensemble:
-            return self._recommend_items_ensemble(user_id, n_recommendations)
-        
-        # Use NeuCF if available
-        if hasattr(self, 'use_neucf') and self.use_neucf and user_id in self.user_to_idx:
-            return self._recommend_items_neucf(user_id, n_recommendations)
-        
-        # Use GMF if available
-        if hasattr(self, 'use_gmf') and self.use_gmf and user_id in self.user_to_idx:
-            return self._recommend_items_gmf(user_id, n_recommendations)
-        
-        # Fallback to item-based CF or popular items
-        if self.item_similarity_matrix is None:
-            if hasattr(self, 'use_gmf') and self.use_gmf and user_id in self.user_to_idx:
-                return self._recommend_items_gmf(user_id, n_recommendations)
-            if hasattr(self, 'use_neucf') and self.use_neucf and user_id in self.user_to_idx:
-                return self._recommend_items_neucf(user_id, n_recommendations)
-            popular_items = self._get_popular_items(n_recommendations)
-            return popular_items[:n_recommendations]
-        
-        # Item-based CF using similarity matrix
+            # New user - return popular items
         if user_id not in self.user_items:
             popular_items = self._get_popular_items(n_recommendations)
             return popular_items[:n_recommendations]
@@ -891,7 +318,7 @@ class RecommenderSystem:
                         sim = self.item_similarity_matrix[interacted_item_idx].get(item_idx, 0.0)
                     else:
                         sim = 0.0
-                else:
+                        else:
                     sim = self.item_similarity_matrix[item_idx, interacted_item_idx]
                 similarity_sum += sim
             
@@ -1042,14 +469,11 @@ class RecommenderSystem:
         print("="*60)
         
         return metrics
-
-    def generate_all_recommendations(self, output_file='recommendations.txt', n_recommendations=20, popularity_penalty=0.0, use_svd=False, use_als=False, use_ensemble=False):
+    
+    def generate_all_recommendations(self, output_file='recommendations.txt', n_recommendations=20, popularity_penalty=0.0):
         """Generate recommendations for all users (for submission)"""
         print(f"\nGenerating {n_recommendations} recommendations for all users...")
-        if use_ensemble and self.use_ensemble:
-            print("  Using ENSEMBLE method")
-        else:
-            print("  Using neural models")
+        print("  Using Item-Based Collaborative Filtering with Cosine Similarity")
         
         all_user_ids = sorted(self.user_items.keys())
         print(f"  Processing {len(all_user_ids)} users...")
@@ -1058,20 +482,18 @@ class RecommenderSystem:
         
         with open(output_file, 'w') as f:
             for idx, user_id in enumerate(all_user_ids):
-                recommendations = self.recommend_items_item_based(user_id, n_recommendations, popularity_penalty, 
-                                                                 use_svd=use_svd, use_als=use_als, 
-                                                                 use_ensemble=use_ensemble)
+                recommendations = self.recommend_items_item_based(user_id, n_recommendations, popularity_penalty)
                 
                 user_items = self.user_items.get(user_id, set())
                 
                 # Ensure exactly n_recommendations items
-                if len(recommendations) < n_recommendations:
-                    for item in popular_items:
-                        if item not in user_items and item not in recommendations:
-                            recommendations.append(item)
-                            if len(recommendations) >= n_recommendations:
-                                break
-                
+        if len(recommendations) < n_recommendations:
+            for item in popular_items:
+                if item not in user_items and item not in recommendations:
+                    recommendations.append(item)
+                    if len(recommendations) >= n_recommendations:
+                        break
+        
                 if len(recommendations) < n_recommendations:
                     for item_id in sorted(self.item_ids):
                         if item_id not in user_items and item_id not in recommendations:
@@ -1103,16 +525,13 @@ def main():
     print("="*60)
     gpu_available, device_info = check_gpu_availability()
     if gpu_available:
-        print("✓ GPU detected and will be used for acceleration")
-        if 'pytorch' in device_info:
-            print(f"  PyTorch GPU: {device_info['pytorch']['device']}")
-            print(f"  Memory: {device_info['pytorch']['memory']}")
+        print("✓ GPU detected and will be used for cosine similarity acceleration")
         if 'cupy' in device_info and device_info['cupy']['available']:
             print("  cuPy: Available")
         else:
-            print("  cuPy: Not installed")
+            print("  cuPy: Not installed (install with: pip install cupy-cuda11x for GPU acceleration)")
     else:
-        print("✗ No GPU detected - will use CPU (slower)")
+        print("✗ No GPU detected - will use CPU")
     print("="*60)
     print()
     
@@ -1128,29 +547,12 @@ def main():
         recommender.build_user_item_matrix()
         
         print("\n" + "="*60)
-        print("TRAINING MODELS")
+        print("COMPUTING SIMILARITY")
         print("="*60)
         
-        # Step 1: Cosine similarity (baseline)
-        print("\n[1/3] Computing Cosine Similarity...")
+        # Compute cosine similarity
+        print("\nComputing Cosine Similarity...")
         recommender.compute_item_similarity(top_k_similar=200, use_gpu=None, chunk_size=2000)
-        
-        # Step 2: GMF
-        print("\n[2/3] Training GMF...")
-        try:
-            recommender.compute_gmf_factors(embedding_dim=128, epochs=25, batch_size=1024)
-        except Exception as e:
-            print(f"  GMF failed: {e}, continuing...")
-        
-        # Step 3: NeuCF
-        print("\n[3/3] Training NeuCF...")
-        try:
-            recommender.compute_neucf_factors(embedding_dim=128, epochs=30, batch_size=1024, mlp_layers=[128, 64, 32])
-        except Exception as e:
-            print(f"  NeuCF failed: {e}, continuing...")
-        
-        # Enable ensemble
-        recommender.use_ensemble = True
         
         # Evaluate
         print("\n" + "="*60)
@@ -1168,29 +570,12 @@ def main():
         recommender.build_user_item_matrix()
         
         print("\n" + "="*60)
-        print("TRAINING MODELS")
+        print("COMPUTING SIMILARITY")
         print("="*60)
         
-        # Step 1: Cosine similarity
-        print("\n[1/3] Computing Cosine Similarity...")
+        # Compute cosine similarity
+        print("\nComputing Cosine Similarity...")
         recommender.compute_item_similarity(top_k_similar=200, use_gpu=None, chunk_size=2000)
-        
-        # Step 2: GMF
-        print("\n[2/3] Training GMF...")
-        try:
-            recommender.compute_gmf_factors(embedding_dim=128, epochs=50)
-        except Exception as e:
-            print(f"  GMF failed: {e}, continuing...")
-        
-        # Step 3: NeuCF
-        print("\n[3/3] Training NeuCF...")
-        try:
-            recommender.compute_neucf_factors(embedding_dim=128, epochs=50, mlp_layers=[128, 64, 32])
-        except Exception as e:
-            print(f"  NeuCF failed: {e}, continuing...")
-        
-        # Enable ensemble
-        recommender.use_ensemble = True
         
         # Generate recommendations
         print("\n" + "="*60)
@@ -1198,8 +583,7 @@ def main():
         print("="*60)
         recommender.generate_all_recommendations(
             output_file='recommendations.txt',
-            n_recommendations=20,
-            use_ensemble=recommender.use_ensemble
+            n_recommendations=20
         )
 
 if __name__ == "__main__":
