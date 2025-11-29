@@ -58,6 +58,7 @@ class RecommenderSystem:
         self.item_to_idx = {}
         self.idx_to_item = {}
         self.item_popularity = {}  # Track item popularity
+        self.max_popularity = 0
         self.popular_items_cache = None  # Cache popular items
         self.reverse_similarity_index = None  # Reverse index for similarity
         self.neucf_model = None  # NeuCF neural model
@@ -143,7 +144,6 @@ class RecommenderSystem:
 
         self.test_user_items.clear()
         new_train = {}
-
         for user_id, items in self.user_items.items():
             items = list(items)
             if len(items) > 1:
@@ -162,6 +162,11 @@ class RecommenderSystem:
         for u, items in self.user_items.items():
             for it in items:
                 self.item_users[it].add(u)
+
+        for item in self.item_users:
+            self.item_popularity[item] = len(self.item_users[item])
+            if len(self.item_users[item]) > self.max_popularity:
+                self.max_popularity = len(self.item_users[item])
 
         total_train = sum(len(v) for v in self.user_items.values())
         total_test = sum(len(v) for v in self.test_user_items.values())
@@ -842,7 +847,7 @@ class RecommenderSystem:
             self.popular_items_cache = [item_id for item_id, _ in item_counts.most_common(n)]
         return self.popular_items_cache
     
-    def recommend_items_item_based(self, user_id, n_recommendations=20, popularity_penalty=0.0, use_svd=False, use_als=False, use_ensemble=False):
+    def recommend_items_item_based(self, user_id, n_recommendations=20, popularity_penalty=-1.0, use_svd=False, use_als=False, use_ensemble=False):
         """
         Generate recommendations
         """
@@ -881,8 +886,6 @@ class RecommenderSystem:
         if not interacted_item_indices:
             popular_items = self._get_popular_items(n_recommendations)
             return [item for item in popular_items if item not in user_items][:n_recommendations]
-        
-        max_popularity = max(self.item_popularity.values()) if popularity_penalty > 0 else 1
         
         candidate_items = set()
         if isinstance(self.item_similarity_matrix, dict):
@@ -937,8 +940,8 @@ class RecommenderSystem:
                     sim = self.item_similarity_matrix[item_idx, interacted_item_idx]
                 similarity_sum += sim
             
-            if popularity_penalty > 0:
-                pop_score = self.item_popularity.get(item_id, 0) / max_popularity
+            if popularity_penalty != 0:
+                pop_score = self.item_popularity.get(item_id, 0) / self.max_popularity
                 similarity_sum *= (1 - popularity_penalty * pop_score)
             
             item_scores[item_id] = similarity_sum
@@ -1247,7 +1250,8 @@ def main():
         recommender.generate_all_recommendations(
             output_file='recommendations.txt',
             n_recommendations=20,
-            use_ensemble=recommender.use_ensemble
+            use_ensemble=recommender.use_ensemble,
+            popularity_penalty=-1.0
         )
 
 if __name__ == "__main__":
