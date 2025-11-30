@@ -1,7 +1,7 @@
 
 ============================================================
 SIMPLE NDCG OPTIMIZATION
-Testing 5 configurations - grab a coffee! ☕
+Testing 5 configurations
 ============================================================
 
 ============================================================
@@ -462,12 +462,3 @@ FINAL SUMMARY - ALL CONFIGURATIONS
 5. More Layers
    Avg NDCG: 0.0864
    NDCG@5=0.0672, NDCG@10=0.0863, NDCG@20=0.1058
-
-============================================================
-🎉 WINNER!
-============================================================
-Best configuration: Faster Learning
-Average NDCG: 0.1330
-
-Use this for your final submission! 🚀
-============================================================
